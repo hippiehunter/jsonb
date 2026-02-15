@@ -177,6 +177,49 @@ impl<'a> ObjectBuilder<'a> {
     }
 }
 
+pub(crate) struct OrderedObjectBuilder<'a> {
+    entries: Vec<(&'a str, JsonbItem<'a>)>,
+}
+
+impl<'a> OrderedObjectBuilder<'a> {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn push_jsonb_item(&mut self, key: &'a str, val_item: JsonbItem<'a>) -> Result<()> {
+        if let Some((last_key, _)) = self.entries.last() {
+            if *last_key == key {
+                return Err(Error::ObjectDuplicateKey);
+            }
+            if *last_key > key {
+                return Err(Error::InvalidJsonb);
+            }
+        }
+        self.entries.push((key, val_item));
+        Ok(())
+    }
+
+    pub(crate) fn build(self) -> Result<OwnedJsonb> {
+        let mut buf = Vec::new();
+        let header = OBJECT_CONTAINER_TAG | self.entries.len() as u32;
+        buf.write_u32::<BigEndian>(header)?;
+
+        let mut jentry_index = reserve_jentries(&mut buf, self.entries.len() * 8);
+        for (key, _) in self.entries.iter() {
+            let key_len = key.len();
+            buf.extend_from_slice(key.as_bytes());
+            let jentry = JEntry::make_string_jentry(key_len);
+            replace_jentry(&mut buf, jentry, &mut jentry_index);
+        }
+        for (_, item) in self.entries.into_iter() {
+            append_jsonb_item(&mut buf, &mut jentry_index, item)?;
+        }
+        Ok(OwnedJsonb::new(buf))
+    }
+}
+
 fn append_jsonb_item(buf: &mut Vec<u8>, jentry_index: &mut usize, item: JsonbItem) -> Result<()> {
     match item {
         JsonbItem::Null => {

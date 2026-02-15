@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::VecDeque;
 use std::ops::Range;
 
 use super::constants::*;
-use super::jentry::JEntry;
 use crate::core::databend::util::jentry_to_jsonb_item;
 use crate::core::JsonbItem;
 use crate::error::Result;
@@ -217,10 +215,11 @@ impl<'a> Iterator for ObjectValueIterator<'a> {
 
 pub(crate) struct ObjectIterator<'a> {
     raw_jsonb: RawJsonb<'a>,
-    key_jentries: VecDeque<JEntry>,
-    jentry_offset: usize,
+    key_jentry_offset: usize,
+    val_jentry_offset: usize,
     key_offset: usize,
     val_offset: usize,
+    index: usize,
     length: usize,
 }
 
@@ -228,23 +227,24 @@ impl<'a> ObjectIterator<'a> {
     pub(crate) fn new(raw_jsonb: RawJsonb<'a>) -> Result<Option<Self>> {
         let (header_type, header_len) = raw_jsonb.read_header(0)?;
         if header_type == OBJECT_CONTAINER_TAG {
-            let mut jentry_offset = 4;
-            let mut key_jentries = VecDeque::with_capacity(header_len);
+            let mut key_jentry_offset = 4;
+            let mut key_length = 0;
             for _ in 0..header_len {
-                let key_jentry = raw_jsonb.read_jentry(jentry_offset)?;
-                jentry_offset += 4;
-                key_jentries.push_back(key_jentry);
+                let key_jentry = raw_jsonb.read_jentry(key_jentry_offset)?;
+                key_jentry_offset += 4;
+                key_length += key_jentry.length as usize;
             }
-            let key_length: usize = key_jentries.iter().map(|j| j.length as usize).sum();
+            let val_jentry_offset = 4 + 4 * header_len;
             let key_offset = 4 + 8 * header_len;
             let val_offset = key_offset + key_length;
 
             Ok(Some(Self {
                 raw_jsonb,
-                key_jentries,
-                jentry_offset,
+                key_jentry_offset: 4,
+                val_jentry_offset,
                 key_offset,
                 val_offset,
+                index: 0,
                 length: header_len,
             }))
         } else {
@@ -261,42 +261,47 @@ impl<'a> Iterator for ObjectIterator<'a> {
     type Item = Result<(&'a str, JsonbItem<'a>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.key_jentries.pop_front() {
-            Some(key_jentry) => {
-                let val_jentry = match self.raw_jsonb.read_jentry(self.jentry_offset) {
-                    Ok(jentry) => jentry,
-                    Err(err) => return Some(Err(err)),
-                };
-                let key_length = key_jentry.length as usize;
-                let val_length = val_jentry.length as usize;
-
-                let key_range = Range {
-                    start: self.key_offset,
-                    end: self.key_offset + key_length,
-                };
-                let key_data = match self.raw_jsonb.slice(key_range) {
-                    Ok(data) => data,
-                    Err(err) => return Some(Err(err)),
-                };
-                let key = unsafe { std::str::from_utf8_unchecked(key_data) };
-
-                let val_range = Range {
-                    start: self.val_offset,
-                    end: self.val_offset + val_length,
-                };
-                let val_data = match self.raw_jsonb.slice(val_range) {
-                    Ok(data) => data,
-                    Err(err) => return Some(Err(err)),
-                };
-                let val_item = jentry_to_jsonb_item(val_jentry, val_data);
-
-                self.jentry_offset += 4;
-                self.key_offset += key_length;
-                self.val_offset += val_length;
-
-                Some(Ok((key, val_item)))
-            }
-            None => None,
+        if self.index >= self.length {
+            return None;
         }
+
+        let key_jentry = match self.raw_jsonb.read_jentry(self.key_jentry_offset) {
+            Ok(jentry) => jentry,
+            Err(err) => return Some(Err(err)),
+        };
+        let val_jentry = match self.raw_jsonb.read_jentry(self.val_jentry_offset) {
+            Ok(jentry) => jentry,
+            Err(err) => return Some(Err(err)),
+        };
+        let key_length = key_jentry.length as usize;
+        let val_length = val_jentry.length as usize;
+
+        let key_range = Range {
+            start: self.key_offset,
+            end: self.key_offset + key_length,
+        };
+        let key_data = match self.raw_jsonb.slice(key_range) {
+            Ok(data) => data,
+            Err(err) => return Some(Err(err)),
+        };
+        let key = unsafe { std::str::from_utf8_unchecked(key_data) };
+
+        let val_range = Range {
+            start: self.val_offset,
+            end: self.val_offset + val_length,
+        };
+        let val_data = match self.raw_jsonb.slice(val_range) {
+            Ok(data) => data,
+            Err(err) => return Some(Err(err)),
+        };
+        let val_item = jentry_to_jsonb_item(val_jentry, val_data);
+
+        self.index += 1;
+        self.key_jentry_offset += 4;
+        self.val_jentry_offset += 4;
+        self.key_offset += key_length;
+        self.val_offset += val_length;
+
+        Some(Ok((key, val_item)))
     }
 }

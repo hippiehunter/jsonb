@@ -14,18 +14,13 @@
 
 use std::fs;
 use std::io::Read;
+use std::borrow::Cow;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-fn jsonb_get(data: &[u8], paths: &[&str], expected: &str) {
-    let paths = paths
-        .iter()
-        .map(|p| jsonb::jsonpath::Path::DotField(std::borrow::Cow::Borrowed(p)))
-        .collect::<Vec<_>>();
-    let json_path = jsonb::jsonpath::JsonPath { paths };
-
+fn jsonb_get(data: &[u8], json_path: &jsonb::jsonpath::JsonPath<'_>, expected: &str) {
     let raw_jsonb = jsonb::RawJsonb::new(data);
-    let result_jsonb = raw_jsonb.select_value_by_path(&json_path).unwrap();
+    let result_jsonb = raw_jsonb.select_value_by_path(json_path).unwrap();
     assert!(result_jsonb.is_some());
     let result_jsonb = result_jsonb.unwrap();
     let result_raw_jsonb = result_jsonb.as_raw();
@@ -85,6 +80,12 @@ fn add_benchmark(c: &mut Criterion) {
 
         let val = jsonb::parse_value(&bytes).unwrap();
         let jsonb_bytes = val.to_vec();
+        let paths = test_suite
+            .paths
+            .iter()
+            .map(|p| jsonb::jsonpath::Path::DotField(Cow::Borrowed(*p)))
+            .collect::<Vec<_>>();
+        let json_path = jsonb::jsonpath::JsonPath { paths };
 
         c.bench_function(
             &format!(
@@ -92,7 +93,7 @@ fn add_benchmark(c: &mut Criterion) {
                 test_suite.file,
                 test_suite.paths.join("->")
             ),
-            |b| b.iter(|| jsonb_get(&jsonb_bytes, &test_suite.paths, test_suite.expected)),
+            |b| b.iter(|| jsonb_get(&jsonb_bytes, &json_path, test_suite.expected)),
         );
 
         c.bench_function(

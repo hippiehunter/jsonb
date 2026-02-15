@@ -24,11 +24,11 @@ fn read(file: &str) -> Vec<u8> {
     data
 }
 
-fn strip_nulls_deser(data: &[u8]) {
-    let mut buf = Vec::new();
+fn strip_nulls_deser(data: &[u8], buf: &mut Vec<u8>) {
+    buf.clear();
     let mut json = from_slice(data).unwrap();
     strip_value_nulls(&mut json);
-    json.write_to_vec(&mut buf);
+    json.write_to_vec(buf);
     assert!(!buf.is_empty());
 }
 
@@ -63,7 +63,8 @@ fn add_benchmark(c: &mut Criterion) {
         let json = from_slice(&bytes).unwrap().to_vec();
 
         c.bench_function(&format!("strip_nulls_deser[{file}]"), |b| {
-            b.iter(|| strip_nulls_deser(&json));
+            let mut buf = Vec::with_capacity(json.len());
+            b.iter(|| strip_nulls_deser(&json, &mut buf));
         });
 
         c.bench_function(&format!("strip_nulls_fast[{file}]"), |b| {

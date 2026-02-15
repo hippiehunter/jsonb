@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
+
+use memchr::memchr2;
 
 use super::constants::*;
 use super::error::Error;
@@ -246,7 +249,7 @@ pub fn from_slice(buf: &[u8]) -> Result<Value<'_>> {
 /// Inspired by `https://github.com/jorgecarleitao/json-deserializer`
 /// Thanks Jorge Leitao.
 pub fn parse_value(buf: &[u8]) -> Result<Value<'_>> {
-    let mut parser = Parser::new(buf);
+    let mut parser = Parser::<false>::new(buf);
     let json_ast = parser.parse()?;
     json_ast.into_value()
 }
@@ -254,7 +257,7 @@ pub fn parse_value(buf: &[u8]) -> Result<Value<'_>> {
 /// Parse JSON text to JSONB Value with standard mode.
 /// The parser will follow standard JSON syntax rules.
 pub fn parse_value_standard_mode(buf: &[u8]) -> Result<Value<'_>> {
-    let mut parser = Parser::new_standard_mode(buf);
+    let mut parser = Parser::<true>::new(buf);
     let json_ast = parser.parse()?;
     json_ast.into_value()
 }
@@ -263,7 +266,7 @@ pub fn parse_value_standard_mode(buf: &[u8]) -> Result<Value<'_>> {
 /// The parser will follow extended JSON syntax rules.
 pub fn parse_owned_jsonb(buf: &[u8]) -> Result<OwnedJsonb> {
     let size = buf.len();
-    let mut parser = Parser::new(buf);
+    let mut parser = Parser::<false>::new(buf);
     let json_ast = parser.parse()?;
     Ok(json_ast.into_owned_jsonb(size))
 }
@@ -272,7 +275,7 @@ pub fn parse_owned_jsonb(buf: &[u8]) -> Result<OwnedJsonb> {
 /// The parser will follow standard JSON syntax rules.
 pub fn parse_owned_jsonb_standard_mode(buf: &[u8]) -> Result<OwnedJsonb> {
     let size = buf.len();
-    let mut parser = Parser::new_standard_mode(buf);
+    let mut parser = Parser::<true>::new(buf);
     let json_ast = parser.parse()?;
     Ok(json_ast.into_owned_jsonb(size))
 }
@@ -281,7 +284,7 @@ pub fn parse_owned_jsonb_standard_mode(buf: &[u8]) -> Result<OwnedJsonb> {
 /// The parser will follow extended JSON syntax rules.
 pub fn parse_owned_jsonb_with_buf(buf: &[u8], result_buf: &mut Vec<u8>) -> Result<()> {
     let size = buf.len();
-    let mut parser = Parser::new(buf);
+    let mut parser = Parser::<false>::new(buf);
     let json_ast = parser.parse()?;
     json_ast.into_owned_jsonb_with_buffer(size, result_buf);
     Ok(())
@@ -294,7 +297,7 @@ pub fn parse_owned_jsonb_standard_mode_with_buf(
     result_buf: &mut Vec<u8>,
 ) -> Result<()> {
     let size = buf.len();
-    let mut parser = Parser::new_standard_mode(buf);
+    let mut parser = Parser::<true>::new(buf);
     let json_ast = parser.parse()?;
     json_ast.into_owned_jsonb_with_buffer(size, result_buf);
     Ok(())
@@ -304,43 +307,21 @@ pub fn parse_owned_jsonb_standard_mode_with_buf(
 ///
 /// This parser implements both standard JSON parsing and an extended syntax with additional features.
 /// It uses a single-pass approach for better performance and provides detailed error reporting.
-struct Parser<'a> {
+struct Parser<'a, const STANDARD: bool> {
     /// Input buffer containing the JSON text to parse
     buf: &'a [u8],
     /// Current position in the buffer
     idx: usize,
-    /// Function pointer for parsing json value based on the mode
-    parse_value_fn: fn(&mut Self) -> Result<JsonAst<'a>>,
-    /// Function pointer for parsing array value based on the mode
-    parse_array_value_fn: fn(&mut Self) -> Result<JsonAst<'a>>,
-    /// Function pointer for parsing object_key based on the mode
-    parse_object_key_fn: fn(&mut Self) -> Result<Cow<'a, str>>,
 }
 
-impl<'a> Parser<'a> {
+impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
     fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            idx: 0,
-            parse_value_fn: Self::parse_json_value,
-            parse_array_value_fn: Self::parse_array_value,
-            parse_object_key_fn: Self::parse_object_key,
-        }
-    }
-
-    fn new_standard_mode(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            idx: 0,
-            parse_value_fn: Self::parse_standard_json_value,
-            parse_array_value_fn: Self::parse_standard_json_value,
-            parse_object_key_fn: Self::parse_standard_object_key,
-        }
+        Self { buf, idx: 0 }
     }
 
     /// Parse a complete JSON document from the input buffer.
     fn parse(&mut self) -> Result<JsonAst<'a>> {
-        let value = (self.parse_value_fn)(self)?;
+        let value = self.parse_mode_value()?;
 
         self.skip_unused();
         if self.idx < self.buf.len() {
@@ -350,11 +331,37 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
+    #[inline]
+    fn parse_mode_value(&mut self) -> Result<JsonAst<'a>> {
+        if STANDARD {
+            self.parse_standard_json_value()
+        } else {
+            self.parse_json_value()
+        }
+    }
+
+    #[inline]
+    fn parse_mode_object_key(&mut self) -> Result<Cow<'a, str>> {
+        if STANDARD {
+            self.parse_standard_object_key()
+        } else {
+            self.parse_object_key()
+        }
+    }
+
     /// Parse a JSON value in standard mode, following strict JSON syntax rules as RFC 8259.
     #[inline]
     fn parse_standard_json_value(&mut self) -> Result<JsonAst<'a>> {
         self.skip_unused();
-        let c = self.next()?;
+        if self.idx >= self.buf.len() {
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+        self.parse_standard_json_value_no_skip()
+    }
+
+    #[inline]
+    fn parse_standard_json_value_no_skip(&mut self) -> Result<JsonAst<'a>> {
+        let c = self.buf[self.idx];
         match c {
             b'n' => self.parse_standard_json_null(),
             b't' => self.parse_standard_json_true(),
@@ -375,9 +382,15 @@ impl<'a> Parser<'a> {
     fn parse_json_value(&mut self) -> Result<JsonAst<'a>> {
         self.skip_unused();
         // Parse empty string to Null value
-        let Ok(c) = self.next() else {
+        if self.idx >= self.buf.len() {
             return Ok(JsonAst::Null);
-        };
+        }
+        self.parse_json_value_no_skip()
+    }
+
+    #[inline]
+    fn parse_json_value_no_skip(&mut self) -> Result<JsonAst<'a>> {
+        let c = self.buf[self.idx];
         match c {
             b'n' | b'N' => self.parse_json_null_or_nan(),
             b't' | b'T' => self.parse_json_true(),
@@ -509,32 +522,33 @@ impl<'a> Parser<'a> {
         while self.idx < self.buf.len() {
             let c = self.buf[self.idx];
 
-            // Fast path: handle common whitespace characters
-            if c.is_ascii_whitespace() {
-                self.idx += 1;
-                continue;
-            }
-
-            // Slow path: handle escape sequences
-            if c == b'\\' && self.idx + 1 < self.buf.len() {
-                let next_c = self.buf[self.idx + 1];
-
-                // Handle simple escapes \n, \r, \t
-                let simple_escape = matches!(next_c, b'n' | b'r' | b't');
-                if simple_escape {
-                    self.idx += 2;
+            match c {
+                // Fast path for JSON whitespace.
+                b' ' | b'\n' | b'\r' | b'\t' => {
+                    self.idx += 1;
                     continue;
                 }
+                // Slow path: handle escape sequences.
+                b'\\' if self.idx + 1 < self.buf.len() => {
+                    let next_c = self.buf[self.idx + 1];
 
-                // Handle \x0C escape
-                let hex_escape = self.idx + 3 < self.buf.len()
-                    && next_c == b'x'
-                    && self.buf[self.idx + 2] == b'0'
-                    && self.buf[self.idx + 3] == b'C';
-                if hex_escape {
-                    self.idx += 4;
-                    continue;
+                    // Handle simple escapes \n, \r, \t.
+                    if matches!(next_c, b'n' | b'r' | b't') {
+                        self.idx += 2;
+                        continue;
+                    }
+
+                    // Handle \x0C escape.
+                    if self.idx + 3 < self.buf.len()
+                        && next_c == b'x'
+                        && self.buf[self.idx + 2] == b'0'
+                        && self.buf[self.idx + 3] == b'C'
+                    {
+                        self.idx += 4;
+                        continue;
+                    }
                 }
+                _ => {}
             }
 
             break;
@@ -725,6 +739,212 @@ impl<'a> Parser<'a> {
     /// - Optimized handling of common number formats
     /// - Specialized handling for extended syntax elements
     fn parse_json_number(&mut self) -> Result<JsonAst<'a>> {
+        if let Some(value) = self.try_parse_json_number_fast()? {
+            return Ok(value);
+        }
+        self.parse_json_number_slow()
+    }
+
+    #[inline]
+    fn try_parse_json_number_fast(&mut self) -> Result<Option<JsonAst<'a>>> {
+        let start_idx = self.idx;
+        let len = self.buf.len();
+        let mut idx = start_idx;
+        let mut negative = false;
+
+        if idx >= len {
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+
+        match self.buf[idx] {
+            b'-' => {
+                negative = true;
+                idx += 1;
+            }
+            // `+123` and `.123` are extended syntax and must be handled by the slow path.
+            b'+' | b'.' => return Ok(None),
+            _ => {}
+        }
+
+        if idx >= len {
+            return Ok(None);
+        }
+
+        let mut hi_value = 0_i128;
+        #[cfg(feature = "arbitrary_precision")]
+        let mut lo_value = 0_i128;
+        let mut small_value = 0_i64;
+        let mut small = true;
+        let mut precision = 0_usize;
+        let mut scale = 0_usize;
+        let mut has_exponent = false;
+
+        macro_rules! push_digit {
+            ($c:expr) => {{
+                let digit = ($c - b'0') as i128;
+
+                if precision < MAX_DECIMAL64_PRECISION {
+                    if small {
+                        small_value = unsafe { small_value.unchecked_mul(10_i64) };
+                        small_value = unsafe { small_value.unchecked_add(digit as i64) };
+                    } else {
+                        hi_value = unsafe { hi_value.unchecked_mul(10_i128) };
+                        hi_value = unsafe { hi_value.unchecked_add(digit) };
+                    }
+                } else if precision < MAX_DECIMAL128_PRECISION {
+                    if small {
+                        hi_value = small_value as i128;
+                        small = false;
+                    }
+                    hi_value = unsafe { hi_value.unchecked_mul(10_i128) };
+                    hi_value = unsafe { hi_value.unchecked_add(digit) };
+                } else {
+                    #[cfg(feature = "arbitrary_precision")]
+                    {
+                        if precision < MAX_DECIMAL256_PRECISION {
+                            lo_value = unsafe { lo_value.unchecked_mul(10_i128) };
+                            lo_value = unsafe { lo_value.unchecked_add(digit) };
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    #[cfg(not(feature = "arbitrary_precision"))]
+                    {
+                        return Ok(None);
+                    }
+                }
+
+                precision += 1;
+            }};
+        }
+
+        match self.buf[idx] {
+            // Keep `0` out of precision to preserve existing extended-mode semantics.
+            b'0' => {
+                idx += 1;
+                if idx < len {
+                    let c = self.buf[idx];
+                    // Leading zeros (`01`) and hex (`0x1`) are extended syntax.
+                    if c.is_ascii_digit() || c == b'x' || c == b'X' {
+                        return Ok(None);
+                    }
+                }
+            }
+            b'1'..=b'9' => {
+                while idx < len {
+                    let c = self.buf[idx];
+                    if !c.is_ascii_digit() {
+                        break;
+                    }
+                    push_digit!(c);
+                    idx += 1;
+                }
+            }
+            _ => return Ok(None),
+        }
+
+        if idx < len && self.buf[idx] == b'.' {
+            idx += 1;
+            let fraction_start = idx;
+            while idx < len {
+                let c = self.buf[idx];
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                push_digit!(c);
+                scale += 1;
+                idx += 1;
+            }
+            // `1.` is extended syntax and must be handled by the slow path.
+            if idx == fraction_start {
+                return Ok(None);
+            }
+        }
+
+        if idx < len && (self.buf[idx] == b'e' || self.buf[idx] == b'E') {
+            has_exponent = true;
+            idx += 1;
+            if idx < len && (self.buf[idx] == b'+' || self.buf[idx] == b'-') {
+                idx += 1;
+            }
+            let exponent_start = idx;
+            while idx < len && self.buf[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            // `1e` is invalid and should be handled by the slow path error handling.
+            if idx == exponent_start {
+                return Ok(None);
+            }
+        }
+
+        if small {
+            hi_value = small_value as i128;
+        }
+
+        self.idx = idx;
+        if has_exponent {
+            let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..idx]) };
+            return match fast_float2::parse(s) {
+                Ok(v) => Ok(Some(JsonAst::Number(Number::Float64(v)))),
+                Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+            };
+        }
+
+        let value = if negative { -hi_value } else { hi_value };
+        if scale == 0 && (UINT64_MIN..=UINT64_MAX).contains(&value) {
+            return Ok(Some(JsonAst::Number(Number::UInt64(
+                u64::try_from(value).unwrap(),
+            ))));
+        } else if scale == 0 && (INT64_MIN..=INT64_MAX).contains(&value) {
+            return Ok(Some(JsonAst::Number(Number::Int64(
+                i64::try_from(value).unwrap(),
+            ))));
+        }
+
+        #[cfg(feature = "arbitrary_precision")]
+        {
+            if (DECIMAL64_MIN..=DECIMAL64_MAX).contains(&value)
+                && precision <= MAX_DECIMAL64_PRECISION
+            {
+                return Ok(Some(JsonAst::Number(Number::Decimal64(Decimal64 {
+                    scale: scale as u8,
+                    value: i64::try_from(value).unwrap(),
+                }))));
+            } else if precision <= MAX_DECIMAL128_PRECISION
+                && (DECIMAL128_MIN..=DECIMAL128_MAX).contains(&value)
+            {
+                return Ok(Some(JsonAst::Number(Number::Decimal128(Decimal128 {
+                    scale: scale as u8,
+                    value,
+                }))));
+            }
+            if precision > MAX_DECIMAL128_PRECISION {
+                let multiplier = POWER_TABLE[precision - MAX_DECIMAL128_PRECISION];
+                let mut i256_value = i256::from(hi_value) * multiplier + i256::from(lo_value);
+                if negative {
+                    i256_value *= -1;
+                }
+                return Ok(Some(JsonAst::Number(Number::Decimal256(Decimal256 {
+                    scale: scale as u8,
+                    value: i256_value,
+                }))));
+            }
+        }
+
+        #[cfg(not(feature = "arbitrary_precision"))]
+        {
+            let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..idx]) };
+            return match fast_float2::parse(s) {
+                Ok(v) => Ok(Some(JsonAst::Number(Number::Float64(v)))),
+                Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+            };
+        }
+
+        // Large exact decimals still need the general path.
+        Ok(None)
+    }
+
+    fn parse_json_number_slow(&mut self) -> Result<JsonAst<'a>> {
         // Store the starting position for potential fallback parsing
         let start_idx = self.idx;
 
@@ -1051,11 +1271,34 @@ impl<'a> Parser<'a> {
     fn parse_quoted_string(&mut self, end_quote: u8) -> Result<Cow<'a, str>> {
         // Mark the starting position (after the opening quote)
         let start_idx = self.idx;
+        let len = self.buf.len();
+
+        // Fast path: if the next special character is the end quote, there are no escapes.
+        if let Some(pos) = memchr2(b'\\', end_quote, &self.buf[self.idx..]) {
+            if self.buf[self.idx + pos] == end_quote {
+                self.idx += pos + 1;
+                let data = &self.buf[start_idx..self.idx - 1];
+                if data.is_ascii() {
+                    let s = unsafe { std::str::from_utf8_unchecked(data) };
+                    return Ok(Cow::Borrowed(s));
+                }
+                return std::str::from_utf8(data)
+                    .map(Cow::Borrowed)
+                    .map_err(|_| self.error(ParseErrorCode::InvalidStringValue));
+            }
+        } else {
+            self.idx = len;
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+
         let mut escapes = 0;
 
         // First pass: Scan the string to find the end and count escape sequences
         loop {
-            let c = self.next()?;
+            if self.idx >= len {
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            }
+            let c = self.buf[self.idx];
             match c {
                 b'\\' => {
                     // Handle escape sequence
@@ -1099,9 +1342,13 @@ impl<'a> Parser<'a> {
             Cow::Owned(s)
         } else {
             // Fast path: No escape sequences, can use the string as-is
-            std::str::from_utf8(data)
-                .map(Cow::Borrowed)
-                .map_err(|_| self.error(ParseErrorCode::InvalidStringValue))?
+            if data.is_ascii() {
+                Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(data) })
+            } else {
+                std::str::from_utf8(data)
+                    .map(Cow::Borrowed)
+                    .map_err(|_| self.error(ParseErrorCode::InvalidStringValue))?
+            }
         };
         Ok(val)
     }
@@ -1116,8 +1363,10 @@ impl<'a> Parser<'a> {
     /// - Must contain at least one character
     fn parse_unquoted_string(&mut self) -> Result<Cow<'a, str>> {
         let start_idx = self.idx;
-
-        let c = self.next()?;
+        if self.idx >= self.buf.len() {
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+        let c = self.buf[self.idx];
         if c.is_ascii_digit() {
             self.step();
             return Err(self.error(ParseErrorCode::ObjectKeyInvalidNumber));
@@ -1154,26 +1403,14 @@ impl<'a> Parser<'a> {
 
         // Get the string data
         let data = &self.buf[start_idx..self.idx];
-        let val = std::str::from_utf8(data)
-            .map(Cow::Borrowed)
-            .map_err(|_| self.error(ParseErrorCode::InvalidStringValue))?;
-        Ok(val)
-    }
-
-    /// Parse an array value with support for empty elements
-    ///
-    /// Extended syntax feature that treats empty elements as null:
-    /// - [1,,3] is parsed as [1,null,3]
-    /// - [1,2,] is parsed as [1,2,null]
-    ///
-    /// This is not allowed in standard JSON but supported in extended mode.
-    #[inline]
-    fn parse_array_value(&mut self) -> Result<JsonAst<'a>> {
-        if self.check_next_either(&b',', &b']').is_some() {
-            Ok(JsonAst::Null)
+        let val = if data.is_ascii() {
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(data) })
         } else {
-            self.parse_json_value()
-        }
+            std::str::from_utf8(data)
+                .map(Cow::Borrowed)
+                .map_err(|_| self.error(ParseErrorCode::InvalidStringValue))?
+        };
+        Ok(val)
     }
 
     /// Parse a JSON array with support for both standard and extended syntax
@@ -1195,33 +1432,51 @@ impl<'a> Parser<'a> {
         // Ensure the array starts with an opening bracket
         self.must_is(&b'[')?;
 
-        let mut first = true;
-        let mut values = Vec::with_capacity(8);
+        let mut values = Vec::with_capacity(2);
+        let len = self.buf.len();
 
-        // Parse array elements until closing bracket is found
+        self.skip_unused();
+        if self.idx >= len {
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+        if self.buf[self.idx] == b']' {
+            self.step();
+            return Ok(JsonAst::Array(values));
+        }
+
+        // Parse array elements until closing bracket is found.
         loop {
-            self.skip_unused();
-            let c = self.next()?;
+            let value = if STANDARD {
+                if self.idx >= len {
+                    return Err(self.error(ParseErrorCode::InvalidEOF));
+                }
+                self.parse_standard_json_value_no_skip()?
+            } else if self.idx < len && matches!(self.buf[self.idx], b',' | b']') {
+                // Extended syntax: empty elements are parsed as null.
+                JsonAst::Null
+            } else {
+                if self.idx >= len {
+                    return Err(self.error(ParseErrorCode::InvalidEOF));
+                }
+                self.parse_json_value_no_skip()?
+            };
+            values.push(value);
 
-            // Check for end of array
+            self.skip_unused();
+            if self.idx >= len {
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            }
+            let c = self.buf[self.idx];
+            if c == b',' {
+                self.step();
+                self.skip_unused();
+                continue;
+            }
             if c == b']' {
                 self.step();
                 break;
             }
-
-            // Handle comma separator between elements (not for the first element)
-            if !first {
-                if c != b',' {
-                    return Err(self.error(ParseErrorCode::ExpectedArrayCommaOrEnd));
-                }
-                self.step();
-            }
-            first = false;
-
-            self.skip_unused();
-            // Parse a regular array element
-            let value = (self.parse_array_value_fn)(self)?;
-            values.push(value);
+            return Err(self.error(ParseErrorCode::ExpectedArrayCommaOrEnd));
         }
         Ok(JsonAst::Array(values))
     }
@@ -1278,58 +1533,93 @@ impl<'a> Parser<'a> {
         // Ensure the object starts with an opening brace
         self.must_is(&b'{')?;
 
-        let mut first = true;
-        let mut obj = Vec::with_capacity(16);
+        let mut obj: Vec<(Cow<'a, str>, JsonAst<'a>, usize)> = Vec::with_capacity(8);
+        let mut in_order = true;
+        let len = self.buf.len();
 
-        // Parse key-value pairs until closing brace is found
+        self.skip_unused();
+        if self.idx >= len {
+            return Err(self.error(ParseErrorCode::InvalidEOF));
+        }
+        if self.buf[self.idx] == b'}' {
+            self.step();
+            return Ok(JsonAst::Object(obj));
+        }
+
+        // Parse key-value pairs until closing brace is found.
         loop {
-            self.skip_unused();
-            let c = self.next()?;
-
-            // Check for end of object
-            if c == b'}' {
-                self.step();
-                break;
-            }
-
-            // Handle comma separator between key-value pairs (not for the first pair)
-            if !first {
-                if c != b',' {
-                    return Err(self.error(ParseErrorCode::ExpectedObjectCommaOrEnd));
-                }
-                self.step();
-            }
-            first = false;
-
-            self.skip_unused();
-            let key_str = (self.parse_object_key_fn)(self)?;
+            let key_str = self.parse_mode_object_key()?;
             let pos = self.idx;
 
             self.skip_unused();
 
-            // Ensure key and value are separated by a colon
-            let c = self.next()?;
-            if c != b':' {
+            // Ensure key and value are separated by a colon.
+            if self.idx >= len {
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            }
+            if self.buf[self.idx] != b':' {
                 return Err(self.error(ParseErrorCode::ExpectedColon));
             }
             self.step();
 
-            // Parse the value
-            let value = (self.parse_value_fn)(self)?;
+            self.skip_unused();
+            let value = if STANDARD {
+                if self.idx >= len {
+                    return Err(self.error(ParseErrorCode::InvalidEOF));
+                }
+                self.parse_standard_json_value_no_skip()?
+            } else {
+                if self.idx >= len {
+                    return Err(self.error(ParseErrorCode::InvalidEOF));
+                }
+                self.parse_json_value_no_skip()?
+            };
 
-            // Add the key-value pair to the object
+            if let Some((prev_key, _, _)) = obj.last() {
+                match prev_key.cmp(&key_str) {
+                    Ordering::Less => {}
+                    Ordering::Equal => {
+                        let key_str = key_str.to_string();
+                        let code = ParseErrorCode::ObjectDuplicateKey(key_str);
+                        return Err(Error::Syntax(code, pos));
+                    }
+                    Ordering::Greater => {
+                        in_order = false;
+                    }
+                }
+            }
+
+            // Add the key-value pair to the object.
             obj.push((key_str, value, pos));
+
+            self.skip_unused();
+            if self.idx >= len {
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            }
+            let c = self.buf[self.idx];
+            if c == b',' {
+                self.step();
+                self.skip_unused();
+                continue;
+            }
+            if c == b'}' {
+                self.step();
+                break;
+            }
+            return Err(self.error(ParseErrorCode::ExpectedObjectCommaOrEnd));
         }
 
-        // Sort the Object fields by key and check for duplicate keys.
-        // Returns an error if duplicate keys are found.
-        obj.sort_by(|a, b| a.0.cmp(&b.0));
-        for i in 1..obj.len() {
-            if obj[i - 1].0 == obj[i].0 {
-                let key_str = obj[i].0.clone().to_string();
-                let pos = obj[i].2;
-                let code = ParseErrorCode::ObjectDuplicateKey(key_str);
-                return Err(Error::Syntax(code, pos));
+        // Fast path: keys were parsed in strict ascending order, no sort required.
+        // Slow path: sort and validate duplicates.
+        if !in_order {
+            obj.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for i in 1..obj.len() {
+                if obj[i - 1].0 == obj[i].0 {
+                    let key_str = obj[i].0.clone().to_string();
+                    let pos = obj[i].2;
+                    let code = ParseErrorCode::ObjectDuplicateKey(key_str);
+                    return Err(Error::Syntax(code, pos));
+                }
             }
         }
         Ok(JsonAst::Object(obj))

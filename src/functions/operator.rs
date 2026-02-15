@@ -27,13 +27,28 @@ use crate::core::JsonbItem;
 use crate::core::JsonbItemType;
 use crate::core::ObjectBuilder;
 use crate::core::ObjectIterator;
+use crate::core::OrderedObjectBuilder;
 use crate::error::*;
 use crate::number::Number;
 use crate::ExtensionValue;
 use crate::OwnedJsonb;
 use crate::RawJsonb;
 
-impl RawJsonb<'_> {
+enum StripNullsResult<'a> {
+    Borrowed(RawJsonb<'a>),
+    Owned(OwnedJsonb),
+}
+
+impl StripNullsResult<'_> {
+    fn into_owned(self) -> OwnedJsonb {
+        match self {
+            StripNullsResult::Borrowed(raw) => raw.to_owned(),
+            StripNullsResult::Owned(owned) => owned,
+        }
+    }
+}
+
+impl<'a> RawJsonb<'a> {
     /// Determines the type of a JSONB value.
     ///
     /// This function returns a string representation of the JSONB value's type.
@@ -544,39 +559,109 @@ impl RawJsonb<'_> {
     /// assert_eq!(stripped.to_string(), "null"); // Remains unchanged
     /// ```
     pub fn strip_nulls(&self) -> Result<OwnedJsonb> {
+        Ok((*self).strip_nulls_impl()?.into_owned())
+    }
+
+    fn strip_nulls_impl(self) -> Result<StripNullsResult<'a>> {
         let jsonb_item_type = self.jsonb_item_type()?;
         match jsonb_item_type {
             JsonbItemType::Array(_) => {
-                let mut array_iter = ArrayIterator::new(*self)?.unwrap();
-                let mut builder = ArrayBuilder::with_capacity(array_iter.len());
+                let mut array_iter = ArrayIterator::new(self)?.unwrap();
+                let mut unchanged_prefix = Vec::with_capacity(array_iter.len());
+                let mut builder: Option<ArrayBuilder<'a>> = None;
                 for item_result in &mut array_iter {
                     let item = item_result?;
+                    let mut changed = false;
+                    let mut replacement = None;
+
                     if let Some(sub_item) = item.as_raw_jsonb() {
-                        let no_nulls_item = sub_item.strip_nulls()?;
-                        builder.push_owned_jsonb(no_nulls_item);
+                        match sub_item.strip_nulls_impl()? {
+                            StripNullsResult::Borrowed(raw) => {
+                                replacement = Some(JsonbItem::Raw(raw));
+                            }
+                            StripNullsResult::Owned(owned) => {
+                                changed = true;
+                                replacement = Some(JsonbItem::Owned(owned));
+                            }
+                        }
+                    }
+
+                    if changed && builder.is_none() {
+                        let mut new_builder = ArrayBuilder::with_capacity(unchanged_prefix.len() + 1);
+                        for prefix_item in unchanged_prefix.drain(..) {
+                            new_builder.push_jsonb_item(prefix_item);
+                        }
+                        builder = Some(new_builder);
+                    }
+
+                    if let Some(builder) = builder.as_mut() {
+                        if let Some(new_item) = replacement {
+                            builder.push_jsonb_item(new_item);
+                        } else {
+                            builder.push_jsonb_item(item);
+                        }
                     } else {
-                        builder.push_jsonb_item(item);
+                        unchanged_prefix.push(item);
                     }
                 }
-                Ok(builder.build()?)
+                match builder {
+                    Some(builder) => Ok(StripNullsResult::Owned(builder.build()?)),
+                    None => Ok(StripNullsResult::Borrowed(self)),
+                }
             }
             JsonbItemType::Object(_) => {
-                let mut object_iter = ObjectIterator::new(*self)?.unwrap();
-                let mut builder = ObjectBuilder::new();
+                let mut object_iter = ObjectIterator::new(self)?.unwrap();
+                let mut unchanged_prefix = Vec::with_capacity(object_iter.len());
+                let mut builder = None;
                 for result in &mut object_iter {
                     let (key, val_item) = result?;
+                    let mut removed = false;
+                    let mut changed = false;
+                    let mut replacement = None;
+
                     if val_item.as_null().is_some() {
-                        continue;
+                        removed = true;
+                        changed = true;
                     } else if let Some(sub_item) = val_item.as_raw_jsonb() {
-                        let no_nulls_item = sub_item.strip_nulls()?;
-                        builder.push_owned_jsonb(key, no_nulls_item)?;
+                        match sub_item.strip_nulls_impl()? {
+                            StripNullsResult::Borrowed(raw) => {
+                                replacement = Some(JsonbItem::Raw(raw));
+                            }
+                            StripNullsResult::Owned(owned) => {
+                                changed = true;
+                                replacement = Some(JsonbItem::Owned(owned));
+                            }
+                        }
+                    }
+
+                    if changed && builder.is_none() {
+                        let mut new_builder =
+                            OrderedObjectBuilder::with_capacity(unchanged_prefix.len() + 1);
+                        for (prefix_key, prefix_val) in unchanged_prefix.drain(..) {
+                            new_builder.push_jsonb_item(prefix_key, prefix_val)?;
+                        }
+                        builder = Some(new_builder);
+                    }
+
+                    if let Some(builder) = builder.as_mut() {
+                        if removed {
+                            continue;
+                        }
+                        if let Some(new_item) = replacement {
+                            builder.push_jsonb_item(key, new_item)?;
+                        } else {
+                            builder.push_jsonb_item(key, val_item)?;
+                        }
                     } else {
-                        builder.push_jsonb_item(key, val_item)?;
+                        unchanged_prefix.push((key, val_item));
                     }
                 }
-                Ok(builder.build()?)
+                match builder {
+                    Some(builder) => Ok(StripNullsResult::Owned(builder.build()?)),
+                    None => Ok(StripNullsResult::Borrowed(self)),
+                }
             }
-            _ => Ok(self.to_owned()),
+            _ => Ok(StripNullsResult::Borrowed(self)),
         }
     }
 

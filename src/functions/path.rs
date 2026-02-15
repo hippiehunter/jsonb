@@ -27,6 +27,7 @@ use crate::core::ObjectIterator;
 use crate::core::ObjectKeyIterator;
 use crate::error::*;
 use crate::jsonpath::JsonPath;
+use crate::jsonpath::Path;
 use crate::jsonpath::Selector;
 use crate::keypath::KeyPath;
 use crate::keypath::KeyPaths;
@@ -427,8 +428,49 @@ impl RawJsonb<'_> {
         &self,
         json_path: &'a JsonPath<'a>,
     ) -> Result<Option<OwnedJsonb>> {
+        if let Some(value) = self.select_value_by_path_fast(json_path)? {
+            return Ok(value);
+        }
         let mut selector = Selector::new(*self);
         selector.select_value(json_path)
+    }
+
+    fn select_value_by_path_fast<'a>(
+        &self,
+        json_path: &'a JsonPath<'a>,
+    ) -> Result<Option<Option<OwnedJsonb>>> {
+        if json_path.paths.is_empty() {
+            return Ok(Some(Some(self.to_owned())));
+        }
+
+        let last_idx = json_path.paths.len().saturating_sub(1);
+        let mut current = *self;
+
+        for (idx, path) in json_path.paths.iter().enumerate() {
+            match path {
+                Path::Root => continue,
+                Path::DotField(name) | Path::ColonField(name) | Path::ObjectField(name) => {
+                    let Some(item) =
+                        current.get_object_value_by_key_name(name, |name, key| key.eq(name))?
+                    else {
+                        return Ok(Some(None));
+                    };
+
+                    if idx == last_idx {
+                        return Ok(Some(Some(OwnedJsonb::from_item(item)?)));
+                    }
+
+                    if let Some(raw) = item.as_raw_jsonb() {
+                        current = raw;
+                    } else {
+                        return Ok(Some(None));
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(Some(Some(self.to_owned())))
     }
 
     /// Checks if a JSON path exists within the JSONB value.
