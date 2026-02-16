@@ -587,7 +587,8 @@ impl<'a> RawJsonb<'a> {
                     }
 
                     if changed && builder.is_none() {
-                        let mut new_builder = ArrayBuilder::with_capacity(unchanged_prefix.len() + 1);
+                        let mut new_builder =
+                            ArrayBuilder::with_capacity(unchanged_prefix.len() + 1);
                         for prefix_item in unchanged_prefix.drain(..) {
                             new_builder.push_jsonb_item(prefix_item);
                         }

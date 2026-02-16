@@ -15,8 +15,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use memchr::memchr2;
-
 use super::constants::*;
 use super::error::Error;
 use super::error::ParseErrorCode;
@@ -28,6 +26,8 @@ use super::value::Value;
 use crate::core::Decoder;
 
 use crate::core::JsonAstEncoder;
+use crate::simd::find_byte2;
+use crate::simd::skip_json_whitespace;
 #[cfg(feature = "arbitrary_precision")]
 use crate::Decimal128;
 #[cfg(feature = "arbitrary_precision")]
@@ -147,7 +147,7 @@ pub(crate) enum JsonAst<'a> {
     String(Cow<'a, str>),
     Number(Number),
     Array(Vec<JsonAst<'a>>),
-    Object(Vec<(Cow<'a, str>, JsonAst<'a>, usize)>),
+    Object(Vec<(Cow<'a, str>, JsonAst<'a>)>),
 }
 
 impl<'a> JsonAst<'a> {
@@ -168,7 +168,7 @@ impl<'a> JsonAst<'a> {
             }
             JsonAst::Object(kvs) => {
                 let mut object = Object::new();
-                for (key, val, _) in kvs.into_iter() {
+                for (key, val) in kvs.into_iter() {
                     let key_str = key.to_string();
                     let value = val.into_value()?;
                     object.insert(key_str, value);
@@ -519,17 +519,17 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
 
     #[inline]
     fn skip_unused(&mut self) {
-        while self.idx < self.buf.len() {
-            let c = self.buf[self.idx];
+        let len = self.buf.len();
+        loop {
+            if self.idx >= len {
+                break;
+            }
 
-            match c {
-                // Fast path for JSON whitespace.
+            match self.buf[self.idx] {
                 b' ' | b'\n' | b'\r' | b'\t' => {
-                    self.idx += 1;
-                    continue;
+                    self.idx = skip_json_whitespace(self.buf, self.idx);
                 }
-                // Slow path: handle escape sequences.
-                b'\\' if self.idx + 1 < self.buf.len() => {
+                b'\\' if self.idx + 1 < len => {
                     let next_c = self.buf[self.idx + 1];
 
                     // Handle simple escapes \n, \r, \t.
@@ -539,7 +539,7 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
                     }
 
                     // Handle \x0C escape.
-                    if self.idx + 3 < self.buf.len()
+                    if self.idx + 3 < len
                         && next_c == b'x'
                         && self.buf[self.idx + 2] == b'0'
                         && self.buf[self.idx + 3] == b'C'
@@ -547,11 +547,11 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
                         self.idx += 4;
                         continue;
                     }
-                }
-                _ => {}
-            }
 
-            break;
+                    break;
+                }
+                _ => break,
+            }
         }
     }
 
@@ -662,6 +662,8 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
         let mut negative = false;
         let mut has_fraction = false;
         let mut has_exponent = false;
+        let mut int_value: u64 = 0;
+        let mut int_overflow = false;
 
         if self.check_next(&b'-') {
             negative = true;
@@ -669,13 +671,32 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
         }
         if self.check_next(&b'0') {
             self.step();
+            int_value = 0;
             if self.check_digit().is_some() {
                 self.step();
                 return Err(self.error(ParseErrorCode::InvalidNumberValue));
             }
         } else {
-            let len = self.step_digits();
-            if len == 0 {
+            let mut has_digit = false;
+            while self.idx < self.buf.len() {
+                let c = self.buf[self.idx];
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                let digit = (c - b'0') as u64;
+                if !int_overflow {
+                    if int_value > (u64::MAX / 10)
+                        || (int_value == (u64::MAX / 10) && digit > (u64::MAX % 10))
+                    {
+                        int_overflow = true;
+                    } else {
+                        int_value = int_value * 10 + digit;
+                    }
+                }
+                self.step();
+                has_digit = true;
+            }
+            if !has_digit {
                 return Err(self.error(ParseErrorCode::InvalidNumberValue));
             }
         }
@@ -701,13 +722,16 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
         }
         let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..self.idx]) };
 
-        if !has_fraction && !has_exponent {
-            if !negative {
-                if let Ok(v) = s.parse::<u64>() {
-                    return Ok(JsonAst::Number(Number::UInt64(v)));
+        if !has_fraction && !has_exponent && !int_overflow {
+            if negative {
+                if int_value <= i64::MAX as u64 {
+                    return Ok(JsonAst::Number(Number::Int64(-(int_value as i64))));
                 }
-            } else if let Ok(v) = s.parse::<i64>() {
-                return Ok(JsonAst::Number(Number::Int64(v)));
+                if int_value == i64::MAX as u64 + 1 {
+                    return Ok(JsonAst::Number(Number::Int64(i64::MIN)));
+                }
+            } else {
+                return Ok(JsonAst::Number(Number::UInt64(int_value)));
             }
         }
 
@@ -1269,15 +1293,30 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
     /// 1. First pass: Find string boundaries and count escapes
     /// 2. Second pass: Process escapes only when necessary
     fn parse_quoted_string(&mut self, end_quote: u8) -> Result<Cow<'a, str>> {
-        // Mark the starting position (after the opening quote)
         let start_idx = self.idx;
         let len = self.buf.len();
+        let mut scan = self.idx;
+        let mut escapes = 0_usize;
 
-        // Fast path: if the next special character is the end quote, there are no escapes.
-        if let Some(pos) = memchr2(b'\\', end_quote, &self.buf[self.idx..]) {
-            if self.buf[self.idx + pos] == end_quote {
-                self.idx += pos + 1;
-                let data = &self.buf[start_idx..self.idx - 1];
+        loop {
+            let hit = if let Some(hit) = find_byte2(self.buf, scan, b'\\', end_quote) {
+                hit
+            } else {
+                self.idx = len;
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            };
+
+            if self.buf[hit] == end_quote {
+                self.idx = hit + 1;
+                let data = &self.buf[start_idx..hit];
+
+                if escapes > 0 {
+                    let decoded_len = data.len() - escapes;
+                    let mut idx = start_idx + 1;
+                    let s = parse_string(data, decoded_len, &mut idx)?;
+                    return Ok(Cow::Owned(s));
+                }
+
                 if data.is_ascii() {
                     let s = unsafe { std::str::from_utf8_unchecked(data) };
                     return Ok(Cow::Borrowed(s));
@@ -1286,71 +1325,36 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
                     .map(Cow::Borrowed)
                     .map_err(|_| self.error(ParseErrorCode::InvalidStringValue));
             }
-        } else {
-            self.idx = len;
-            return Err(self.error(ParseErrorCode::InvalidEOF));
-        }
 
-        let mut escapes = 0;
-
-        // First pass: Scan the string to find the end and count escape sequences
-        loop {
-            if self.idx >= len {
+            escapes += 1;
+            let escape_start = hit + 1;
+            if escape_start >= len {
+                self.idx = len;
                 return Err(self.error(ParseErrorCode::InvalidEOF));
             }
-            let c = self.buf[self.idx];
-            match c {
-                b'\\' => {
-                    // Handle escape sequence
-                    self.step();
-                    escapes += 1;
-                    let next_c = self.next()?;
-                    if next_c == b'u' {
-                        // Handle Unicode escape sequence
-                        self.step();
-                        let next_c = self.next()?;
-                        if next_c == b'{' {
-                            // Extended Unicode format: \u{XXXX}
-                            self.step_by(UNICODE_LEN + 2);
-                        } else {
-                            // Standard Unicode format: \uXXXX
-                            self.step_by(UNICODE_LEN);
-                        }
-                    } else {
-                        // Simple escape sequence like \n, \t, etc.
-                        self.step();
-                    }
+
+            if self.buf[escape_start] == b'u' {
+                let unicode_start = escape_start + 1;
+                if unicode_start >= len {
+                    self.idx = len;
+                    return Err(self.error(ParseErrorCode::InvalidEOF));
                 }
-                _ => {
-                    self.step();
-                    if c == end_quote {
-                        break;
-                    }
+                if self.buf[unicode_start] == b'{' {
+                    scan = unicode_start + UNICODE_LEN + 2;
+                } else {
+                    scan = unicode_start + UNICODE_LEN;
                 }
+            } else {
+                scan = escape_start + 1;
+            }
+
+            if scan > len {
+                self.idx = len;
+                return Err(self.error(ParseErrorCode::InvalidEOF));
+            } else {
+                self.idx = scan;
             }
         }
-
-        // Get the string data (excluding quotes)
-        let data = &self.buf[start_idx..self.idx - 1];
-
-        // Second pass: Process the string based on whether it contains escape sequences
-        let val = if escapes > 0 {
-            // String contains escape sequences, need to process them
-            let len = self.idx - 1 - start_idx - escapes;
-            let mut idx = start_idx + 1;
-            let s = parse_string(data, len, &mut idx)?;
-            Cow::Owned(s)
-        } else {
-            // Fast path: No escape sequences, can use the string as-is
-            if data.is_ascii() {
-                Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(data) })
-            } else {
-                std::str::from_utf8(data)
-                    .map(Cow::Borrowed)
-                    .map_err(|_| self.error(ParseErrorCode::InvalidStringValue))?
-            }
-        };
-        Ok(val)
     }
 
     /// Parse an unquoted string literal for object keys
@@ -1543,7 +1547,7 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
         }
         if self.buf[self.idx] == b'}' {
             self.step();
-            return Ok(JsonAst::Object(obj));
+            return Ok(JsonAst::Object(Vec::new()));
         }
 
         // Parse key-value pairs until closing brace is found.
@@ -1616,13 +1620,16 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
             for i in 1..obj.len() {
                 if obj[i - 1].0 == obj[i].0 {
                     let key_str = obj[i].0.clone().to_string();
-                    let pos = obj[i].2;
                     let code = ParseErrorCode::ObjectDuplicateKey(key_str);
-                    return Err(Error::Syntax(code, pos));
+                    return Err(Error::Syntax(code, obj[i].2));
                 }
             }
         }
-        Ok(JsonAst::Object(obj))
+        let mut kvs = Vec::with_capacity(obj.len());
+        for (key, value, _) in obj {
+            kvs.push((key, value));
+        }
+        Ok(JsonAst::Object(kvs))
     }
 }
 

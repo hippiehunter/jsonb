@@ -22,6 +22,7 @@ use jsonb::core::JsonbItemType;
 use jsonb::from_raw_jsonb;
 use jsonb::from_slice;
 use jsonb::jsonpath::parse_json_path;
+use jsonb::jsonpath::PathValue;
 use jsonb::keypath::parse_key_paths;
 use jsonb::keypath::KeyPath;
 use jsonb::keypath::KeyPaths;
@@ -1318,6 +1319,31 @@ fn test_get_by_keypath() {
             None => assert_eq!(res, None),
         }
     }
+}
+
+#[test]
+fn test_select_value_by_path_borrowed() {
+    let owned_jsonb = r#"{"a":{"b":"v"},"arr":[1,2,3]}"#.parse::<OwnedJsonb>().unwrap();
+    let raw_jsonb = owned_jsonb.as_raw();
+
+    let path = parse_json_path("$.a.b".as_bytes()).unwrap();
+    let result = raw_jsonb.select_value_by_path_borrowed(&path).unwrap();
+    assert_eq!(result, Some(PathValue::String(Cow::Borrowed("v"))));
+
+    let path = parse_json_path("$".as_bytes()).unwrap();
+    let result = raw_jsonb.select_value_by_path_borrowed(&path).unwrap();
+    match result {
+        Some(PathValue::Raw(raw)) => assert_eq!(raw, raw_jsonb),
+        _ => panic!("expected borrowed raw root value"),
+    }
+
+    let path = parse_json_path("$.a.missing".as_bytes()).unwrap();
+    let result = raw_jsonb.select_value_by_path_borrowed(&path).unwrap();
+    assert_eq!(result, None);
+
+    let path = parse_json_path("$.arr[*]".as_bytes()).unwrap();
+    let result = raw_jsonb.select_value_by_path_borrowed(&path);
+    assert_eq!(result, Err(Error::InvalidJsonPath));
 }
 
 #[test]

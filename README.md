@@ -77,6 +77,13 @@ pub enum Value<'a> {
 
 `jsonb` implements a number of commonly used built-in functions. Since most functions only focus on a subset of the total value, using container headers and JEntry headers to can efficiently skip over intermediate parts of the `jsonb` value. This avoids time-consuming deserialisation operations and provides very high performance. For more information, see https://docs.rs/jsonb/latest/jsonb/#functions
 
+## Performance workflow
+
+For repeatable benchmark and profiler runs (`criterion`, `perf`, `callgrind`,
+AMD uProf), use the scripts under `scripts/perf/`.
+
+Detailed instructions are in `docs/performance.md`.
+
 ## SQL/JSONPath
 
 [SQL/JSONPath](https://www.iso.org/standard/67367.html) is a query language used to select and extract a subset of elements from a `jsonb` value.

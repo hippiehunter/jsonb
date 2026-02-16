@@ -28,6 +28,7 @@ use crate::core::ObjectKeyIterator;
 use crate::error::*;
 use crate::jsonpath::JsonPath;
 use crate::jsonpath::Path;
+use crate::jsonpath::PathValue;
 use crate::jsonpath::Selector;
 use crate::keypath::KeyPath;
 use crate::keypath::KeyPaths;
@@ -435,6 +436,24 @@ impl RawJsonb<'_> {
         selector.select_value(json_path)
     }
 
+    /// Selects a value by path and returns a borrowed result without materializing an `OwnedJsonb`.
+    ///
+    /// This method only supports direct object-field chains (`$`, `.field`, `:field`, `["field"]`).
+    /// For other JSONPath features (wildcards, filters, array indices, recursive descent, expressions),
+    /// it returns `Error::InvalidJsonPath`.
+    pub fn select_value_by_path_borrowed<'a>(
+        &'a self,
+        json_path: &'a JsonPath<'a>,
+    ) -> Result<Option<PathValue<'a>>> {
+        let Some(item_opt) = self.select_value_by_path_fast_item(json_path)? else {
+            return Err(Error::InvalidJsonPath);
+        };
+        let Some(item) = item_opt else {
+            return Ok(None);
+        };
+        Self::path_value_from_jsonb_item(item).map(Some)
+    }
+
     fn select_value_by_path_fast<'a>(
         &self,
         json_path: &'a JsonPath<'a>,
@@ -471,6 +490,58 @@ impl RawJsonb<'_> {
         }
 
         Ok(Some(Some(self.to_owned())))
+    }
+
+    fn select_value_by_path_fast_item<'a>(
+        &'a self,
+        json_path: &'a JsonPath<'a>,
+    ) -> Result<Option<Option<JsonbItem<'a>>>> {
+        if json_path.paths.is_empty() {
+            let item = JsonbItem::from_raw_jsonb(*self)?;
+            return Ok(Some(Some(item)));
+        }
+
+        let last_idx = json_path.paths.len().saturating_sub(1);
+        let mut current = *self;
+
+        for (idx, path) in json_path.paths.iter().enumerate() {
+            match path {
+                Path::Root => continue,
+                Path::DotField(name) | Path::ColonField(name) | Path::ObjectField(name) => {
+                    let Some(item) =
+                        current.get_object_value_by_key_name(name, |name, key| key.eq(name))?
+                    else {
+                        return Ok(Some(None));
+                    };
+
+                    if idx == last_idx {
+                        return Ok(Some(Some(item)));
+                    }
+
+                    if let Some(raw) = item.as_raw_jsonb() {
+                        current = raw;
+                    } else {
+                        return Ok(Some(None));
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let item = JsonbItem::from_raw_jsonb(*self)?;
+        Ok(Some(Some(item)))
+    }
+
+    #[inline]
+    fn path_value_from_jsonb_item<'a>(item: JsonbItem<'a>) -> Result<PathValue<'a>> {
+        match item {
+            JsonbItem::Null => Ok(PathValue::Null),
+            JsonbItem::Boolean(v) => Ok(PathValue::Boolean(v)),
+            JsonbItem::Number(v) => Ok(PathValue::Number(v.as_number()?)),
+            JsonbItem::String(v) => Ok(PathValue::String(v)),
+            JsonbItem::Raw(v) => Ok(PathValue::Raw(v)),
+            JsonbItem::Extension(_) | JsonbItem::Owned(_) => Err(Error::InvalidJsonType),
+        }
     }
 
     /// Checks if a JSON path exists within the JSONB value.

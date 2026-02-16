@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
-use std::borrow::Cow;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use jsonb::jsonpath::PathValue;
 
 fn jsonb_get(data: &[u8], json_path: &jsonb::jsonpath::JsonPath<'_>, expected: &str) {
     let raw_jsonb = jsonb::RawJsonb::new(data);
@@ -27,6 +28,17 @@ fn jsonb_get(data: &[u8], json_path: &jsonb::jsonpath::JsonPath<'_>, expected: &
 
     let s = result_raw_jsonb.as_str().unwrap().unwrap();
     assert_eq!(s, expected);
+}
+
+fn jsonb_get_borrowed(data: &[u8], json_path: &jsonb::jsonpath::JsonPath<'_>, expected: &str) {
+    let raw_jsonb = jsonb::RawJsonb::new(data);
+    let result = raw_jsonb.select_value_by_path_borrowed(json_path).unwrap();
+    assert!(result.is_some());
+    let result = result.unwrap();
+    match result {
+        PathValue::String(s) => assert_eq!(s, expected),
+        _ => panic!("expected borrowed string"),
+    }
 }
 
 fn serde_json_get(data: &[u8], paths: &Vec<&str>, expected: &str) {
@@ -73,6 +85,11 @@ fn add_benchmark(c: &mut Criterion) {
             paths: vec!["search_metadata", "max_id_str"],
             expected: "505874924095815681",
         },
+        TestSuite {
+            file: "status_string_values",
+            paths: vec!["status", "status_fSw0bx7gb5GpJHrw2JDN_kgke"],
+            expected: "sViysVYYl35oR",
+        },
     ];
 
     for test_suite in test_suites {
@@ -94,6 +111,15 @@ fn add_benchmark(c: &mut Criterion) {
                 test_suite.paths.join("->")
             ),
             |b| b.iter(|| jsonb_get(&jsonb_bytes, &json_path, test_suite.expected)),
+        );
+
+        c.bench_function(
+            &format!(
+                "jsonb get borrowed {}->{}",
+                test_suite.file,
+                test_suite.paths.join("->")
+            ),
+            |b| b.iter(|| jsonb_get_borrowed(&jsonb_bytes, &json_path, test_suite.expected)),
         );
 
         c.bench_function(

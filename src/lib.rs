@@ -63,6 +63,22 @@
 
 #![allow(clippy::uninlined_format_args)]
 
+#[cfg(all(
+    not(doc),
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi1",
+        target_feature = "bmi2",
+        target_feature = "fma",
+        target_feature = "lzcnt",
+        target_feature = "movbe",
+        target_feature = "popcnt",
+        target_feature = "sse4.2",
+    ))
+))]
+compile_error!("jsonb requires x86-64-v3. Build with -C target-cpu=x86-64-v3.");
+
 mod constants;
 pub mod core;
 mod error;
@@ -75,6 +91,7 @@ mod number;
 mod owned;
 mod parser;
 mod raw;
+mod simd;
 mod util;
 mod value;
 

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use core::ops::Range;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::io::Write;
 
@@ -241,14 +243,36 @@ impl<'a> RawJsonb<'a> {
         if header_type != OBJECT_CONTAINER_TAG || length == 0 {
             return Ok(None);
         }
+        let name_bytes = key_name.as_bytes();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            const SIMD_KEY_SCAN_THRESHOLD: usize = 32;
+            if length >= SIMD_KEY_SCAN_THRESHOLD {
+                return self.get_object_value_by_key_name_simd(length, name_bytes, &eq_func);
+            }
+        }
+
+        self.get_object_value_by_key_name_scalar(length, name_bytes, &eq_func)
+    }
+
+    #[inline]
+    fn get_object_value_by_key_name_scalar<F>(
+        &self,
+        length: usize,
+        name_bytes: &[u8],
+        eq_func: &F,
+    ) -> Result<Option<JsonbItem<'a>>>
+    where
+        F: Fn(&[u8], &[u8]) -> bool,
+    {
         let mut index = 0;
         let mut jentry_offset = 4;
         let mut item_offset = 4 + 8 * length;
-
         let mut key_matched = false;
-        let name_len = key_name.len();
-        let name_bytes = key_name.as_bytes();
-        while index < length {
+        let name_len = name_bytes.len();
+
+        while !key_matched && index < length {
             let key_jentry = self.read_jentry(jentry_offset)?;
             let key_len = key_jentry.length as usize;
 
@@ -256,17 +280,16 @@ impl<'a> RawJsonb<'a> {
             jentry_offset += 4;
             item_offset += key_len;
 
-            // check if key match the name.
-            if name_len == key_len {
-                let key_range = Range {
-                    start: item_offset - key_len,
-                    end: item_offset,
-                };
-                let key_data = self.slice(key_range)?;
-                if eq_func(name_bytes, key_data) {
-                    key_matched = true;
-                    break;
-                }
+            if name_len != key_len {
+                continue;
+            }
+            let key_range = Range {
+                start: item_offset - key_len,
+                end: item_offset,
+            };
+            let key_data = self.slice(key_range)?;
+            if eq_func(name_bytes, key_data) {
+                key_matched = true;
             }
         }
 
@@ -274,7 +297,6 @@ impl<'a> RawJsonb<'a> {
             return Ok(None);
         }
         let val_index = index - 1;
-        // skip unmatched keys and values.
         while index < length + val_index {
             let jentry = self.read_jentry(jentry_offset)?;
             index += 1;
@@ -282,10 +304,8 @@ impl<'a> RawJsonb<'a> {
             item_offset += jentry.length as usize;
         }
 
-        // read value item data
         let value_jentry = self.read_jentry(jentry_offset)?;
         let value_len = value_jentry.length as usize;
-
         let value_range = Range {
             start: item_offset,
             end: item_offset + value_len,
@@ -293,6 +313,158 @@ impl<'a> RawJsonb<'a> {
         let value_data = self.slice(value_range)?;
         let value_item = jentry_to_jsonb_item(value_jentry, value_data);
         Ok(Some(value_item))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn get_object_value_by_key_name_simd<F>(
+        &self,
+        length: usize,
+        name_bytes: &[u8],
+        eq_func: &F,
+    ) -> Result<Option<JsonbItem<'a>>>
+    where
+        F: Fn(&[u8], &[u8]) -> bool,
+    {
+        let mut index = 0;
+        let mut jentry_offset = 4;
+        let mut item_offset = 4 + 8 * length;
+        let mut key_matched = false;
+        let name_len = name_bytes.len();
+        let name_len_u32 = name_len as u32;
+
+        while !key_matched && index + 8 <= length {
+            let (key_lens, matched_mask) =
+                self.read_jentry_lengths8_with_match_mask(jentry_offset, name_len_u32)?;
+
+            macro_rules! check_lane {
+                ($lane:expr) => {{
+                    let key_len = key_lens[$lane] as usize;
+                    index += 1;
+                    jentry_offset += 4;
+                    item_offset += key_len;
+                    if (matched_mask & (1_u8 << $lane)) != 0 {
+                        let key_range = Range {
+                            start: item_offset - key_len,
+                            end: item_offset,
+                        };
+                        let key_data = self.slice(key_range)?;
+                        if eq_func(name_bytes, key_data) {
+                            key_matched = true;
+                        }
+                    }
+                }};
+            }
+
+            check_lane!(0);
+            if key_matched {
+                break;
+            }
+            check_lane!(1);
+            if key_matched {
+                break;
+            }
+            check_lane!(2);
+            if key_matched {
+                break;
+            }
+            check_lane!(3);
+            if key_matched {
+                break;
+            }
+            check_lane!(4);
+            if key_matched {
+                break;
+            }
+            check_lane!(5);
+            if key_matched {
+                break;
+            }
+            check_lane!(6);
+            if key_matched {
+                break;
+            }
+            check_lane!(7);
+            if key_matched {
+                break;
+            }
+        }
+
+        while !key_matched && index < length {
+            let key_jentry = self.read_jentry(jentry_offset)?;
+            let key_len = key_jentry.length as usize;
+
+            index += 1;
+            jentry_offset += 4;
+            item_offset += key_len;
+
+            if name_len != key_len {
+                continue;
+            }
+            let key_range = Range {
+                start: item_offset - key_len,
+                end: item_offset,
+            };
+            let key_data = self.slice(key_range)?;
+            if eq_func(name_bytes, key_data) {
+                key_matched = true;
+            }
+        }
+
+        if !key_matched {
+            return Ok(None);
+        }
+        let val_index = index - 1;
+        while index < length + val_index {
+            let jentry = self.read_jentry(jentry_offset)?;
+            index += 1;
+            jentry_offset += 4;
+            item_offset += jentry.length as usize;
+        }
+
+        let value_jentry = self.read_jentry(jentry_offset)?;
+        let value_len = value_jentry.length as usize;
+        let value_range = Range {
+            start: item_offset,
+            end: item_offset + value_len,
+        };
+        let value_data = self.slice(value_range)?;
+        let value_item = jentry_to_jsonb_item(value_jentry, value_data);
+        Ok(Some(value_item))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn read_jentry_lengths8_with_match_mask(
+        &self,
+        index: usize,
+        target_len: u32,
+    ) -> Result<([u32; 8], u8)> {
+        let bytes: &[u8; 32] = self
+            .data
+            .get(index..index + 32)
+            .ok_or(Error::InvalidEOF)?
+            .try_into()
+            .unwrap();
+
+        let mut lens = [0_u32; 8];
+        let mask = unsafe {
+            let raw = _mm256_loadu_si256(bytes.as_ptr() as *const __m256i);
+            let shuffle = _mm256_setr_epi8(
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11,
+                10, 9, 8, 15, 14, 13, 12,
+            );
+            let swapped = _mm256_shuffle_epi8(raw, shuffle);
+            let len_mask = _mm256_set1_epi32(JENTRY_OFF_LEN_MASK as i32);
+            let lens_vec = _mm256_and_si256(swapped, len_mask);
+            _mm256_storeu_si256(lens.as_mut_ptr() as *mut __m256i, lens_vec);
+
+            let expected = _mm256_set1_epi32(target_len as i32);
+            let cmp = _mm256_cmpeq_epi32(lens_vec, expected);
+            _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u8
+        };
+
+        Ok((lens, mask))
     }
 
     pub(super) fn read_header(&self, index: usize) -> Result<(u32, usize)> {

@@ -1171,11 +1171,11 @@ impl<'a> JsonAstEncoder<'a> {
 
     /// Encodes an object of `JsonAst` values (vector of key-value pairs).
     /// Returns the total length of the encoded object.
-    fn encode_object(&mut self, obj: &[(Cow<'a, str>, JsonAst<'a>, usize)]) -> usize {
+    fn encode_object(&mut self, obj: &[(Cow<'a, str>, JsonAst<'a>)]) -> usize {
         let (mut object_len, mut jentry_index) = self.base_encoder.encode_object_header(obj.len());
 
         // encode all keys first
-        for (key, _, _) in obj.iter() {
+        for (key, _) in obj.iter() {
             let len = key.len();
             object_len += len;
             self.base_encoder.buf.extend_from_slice(key.as_bytes());
@@ -1183,7 +1183,7 @@ impl<'a> JsonAstEncoder<'a> {
             self.base_encoder.replace_jentry(jentry, &mut jentry_index);
         }
         // encode all values
-        for (_, value, _) in obj.iter() {
+        for (_, value) in obj.iter() {
             let jentry = self.encode_value(value);
             object_len += jentry.length as usize;
             self.base_encoder.replace_jentry(jentry, &mut jentry_index);
