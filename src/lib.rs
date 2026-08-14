@@ -63,10 +63,13 @@
 
 #![allow(clippy::uninlined_format_args)]
 
+// The x86-64-v3 floor is a property of the AVX2 parser fast path, so it is
+// only meaningful where that path is the one being compiled. Other targets use
+// the scalar equivalents in `simd` and have no such requirement.
 #[cfg(all(
     not(doc),
+    target_arch = "x86_64",
     not(all(
-        target_arch = "x86_64",
         target_feature = "avx2",
         target_feature = "bmi1",
         target_feature = "bmi2",
