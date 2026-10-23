@@ -38,6 +38,8 @@ pub(super) const NUMBER_INT: u8 = 0x40;
 pub(super) const NUMBER_UINT: u8 = 0x50;
 pub(super) const NUMBER_FLOAT: u8 = 0x60;
 pub(super) const NUMBER_DECIMAL: u8 = 0x70;
+/// A `numeric` past the fixed-width decimals, stored as its output text.
+pub(super) const NUMBER_NUMERIC: u8 = 0x80;
 
 // JSONB extension constants
 pub(super) const EXTENSION_BINARY: u8 = 0x00;

@@ -119,7 +119,8 @@ impl<'a> RawJsonb<'a> {
                             Number::UInt64(_) | Number::Int64(_) => Ok(TYPE_INTEGER),
                             Number::Decimal64(_)
                             | Number::Decimal128(_)
-                            | Number::Decimal256(_) => Ok(TYPE_DECIMAL),
+                            | Number::Decimal256(_)
+                            | Number::Numeric(_) => Ok(TYPE_DECIMAL),
                             Number::Float64(_) => Ok(TYPE_DOUBLE),
                         }
                     }

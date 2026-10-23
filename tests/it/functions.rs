@@ -1145,7 +1145,7 @@ fn test_type_of() {
     let sources = vec![
         (r#"null"#, "NULL_VALUE"),
         (r#"1"#, "INTEGER"),
-        (r#"1.912000000000000e+02"#, "DOUBLE"),
+        (r#"1.912000000000000e+02"#, "DECIMAL"),
         (r#""test""#, "STRING"),
         (r#"[1,2,3,4,5]"#, "ARRAY"),
         (r#"{"a":1,"b":2}"#, "OBJECT"),

@@ -189,6 +189,12 @@ impl From<&JsonValue> for Value<'_> {
                             scale: 0,
                         }));
                     }
+                    // A spelling past every fixed-width kind keeps its exact
+                    // value rather than the nearest f64.
+                    if let Ok(number @ Number::Numeric(_)) = Number::from_decimal_text(&v.to_string())
+                    {
+                        return Value::Number(number);
+                    }
                 }
                 if let Some(n) = v.as_f64() {
                     Value::Number(Number::Float64(n))
@@ -258,6 +264,10 @@ impl<'a> From<Value<'a>> for JsonValue {
                     } else {
                         JsonValue::Null
                     }
+                }
+                #[cfg(feature = "arbitrary_precision")]
+                Number::Numeric(ref d) => {
+                    JsonValue::Number(JsonNumber::from_string_unchecked(d.as_str().to_string()))
                 }
                 _ => {
                     if let Some(n) = JsonNumber::from_f64(v.as_f64()) {

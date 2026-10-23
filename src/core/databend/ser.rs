@@ -39,11 +39,13 @@ use crate::RawJsonb;
 use crate::Decimal128;
 use crate::Decimal256;
 use crate::Decimal64;
+use crate::Numeric;
 use ethnum::i256;
 
 use crate::constants::NUMBER_STRUCT_FIELD_HIGH_VALUE;
 use crate::constants::NUMBER_STRUCT_FIELD_LOW_VALUE;
 use crate::constants::NUMBER_STRUCT_FIELD_SCALE;
+use crate::constants::NUMBER_STRUCT_FIELD_TEXT;
 use crate::constants::NUMBER_STRUCT_FIELD_VALUE;
 use crate::constants::NUMBER_STRUCT_TOKEN;
 
@@ -567,7 +569,23 @@ impl ser::SerializeStruct for StructSerializer<'_> {
 
     fn end(mut self) -> Result<Self::Ok> {
         if self.name == NUMBER_STRUCT_TOKEN {
-            let num = if self.values.len() == 2 {
+            let num = if self.values.len() == 1 {
+                let (text_field_name, text_jsonb) = self.values.remove(0);
+                if text_field_name != NUMBER_STRUCT_FIELD_TEXT {
+                    return Err(ser::Error::custom(format!(
+                        "Invalid number struct field name: {}",
+                        text_field_name
+                    )));
+                }
+                let raw_jsonb = text_jsonb.as_raw();
+                let Ok(Some(text)) = raw_jsonb.as_str() else {
+                    return Err(ser::Error::custom(format!(
+                        "Invalid number struct text={}",
+                        raw_jsonb.to_string()
+                    )));
+                };
+                Number::from_numeric(Numeric::parse(&text)?)
+            } else if self.values.len() == 2 {
                 let (value_field_name, value_jsonb) = self.values.remove(1);
                 let (scale_field_name, scale_jsonb) = self.values.remove(0);
 

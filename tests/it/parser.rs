@@ -156,14 +156,6 @@ fn test_parse_f64() {
 
     let tests = vec![
         (
-            "100e777777777777777777777777777",
-            Value::Number(Number::Float64(f64::INFINITY)),
-        ),
-        (
-            "-100e777777777777777777777777777",
-            Value::Number(Number::Float64(f64::NEG_INFINITY)),
-        ),
-        (
             "1000000000000000000000000000000000000000000000000000000000000\
              000000000000000000000000000000000000000000000000000000000000\
              000000000000000000000000000000000000000000000000000000000000\
@@ -212,7 +204,6 @@ fn test_parse_f64() {
         ("0.00e00", Value::Number(Number::Float64(0.0))),
         ("0.00e+00", Value::Number(Number::Float64(0.0))),
         ("0.00e-00", Value::Number(Number::Float64(0.0))),
-        ("3.5E-2147483647", Value::Number(Number::Float64(0.0))),
         (
             "0.0100000000000000000001",
             Value::Number(Number::Float64(0.01)),
@@ -230,10 +221,7 @@ fn test_parse_f64() {
             "0.0000000000000000000000000000000000000000000000000123e50",
             Value::Number(Number::Float64(1.23)),
         ),
-        (
-            "100e-777777777777777777777777777",
-            Value::Number(Number::Float64(0.0)),
-        ),
+
         (
             "1010101010101010101010101010101010101010",
             Value::Number(Number::Float64(1.010_101_010_101_01e39)),
@@ -242,10 +230,7 @@ fn test_parse_f64() {
             "0.1010101010101010101010101010101010101010",
             Value::Number(Number::Float64(0.101_010_101_010_101_01)),
         ),
-        (
-            "0e1000000000000000000000000000000000000000000000",
-            Value::Number(Number::Float64(0.0)),
-        ),
+
         (
             "1000000000000000000000000000000000000000000000000000000000000\
              000000000000000000000000000000000000000000000000000000000000\
@@ -285,6 +270,23 @@ fn test_parse_f64() {
     ];
     test_parse_ok(tests.clone());
     test_parse_standard_ok(tests);
+
+    // A number keeps its exact value, so one past `numeric`'s range, 131072
+    // integer digits and 16383 fraction digits, is refused rather than read
+    // as an infinity or zero.
+    for overflow in [
+        "100e777777777777777777777777777",
+        "-100e777777777777777777777777777",
+        "3.5E-2147483647",
+        "100e-777777777777777777777777777",
+        "0e1000000000000000000000000000000000000000000000",
+    ] {
+        assert!(parse_value(overflow.as_bytes()).is_err(), "{overflow}");
+        assert!(
+            parse_value_standard_mode(overflow.as_bytes()).is_err(),
+            "{overflow}"
+        );
+    }
 
     // Extended JSON number syntax
     let extended_tests = vec![

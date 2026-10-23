@@ -38,6 +38,7 @@ use crate::number::Decimal128;
 use crate::number::Decimal256;
 use crate::number::Decimal64;
 use crate::Number;
+use crate::Numeric;
 use crate::Object;
 use crate::OwnedJsonb;
 use crate::RawJsonb;
@@ -673,6 +674,12 @@ impl Number {
                 writer.write_all(&v.scale.to_be_bytes())?;
                 Ok(34)
             }
+            Self::Numeric(v) => {
+                let text = v.as_str().as_bytes();
+                writer.write_all(&[NUMBER_NUMERIC])?;
+                writer.write_all(text)?;
+                Ok(1 + text.len())
+            }
         }
     }
 
@@ -744,6 +751,11 @@ impl Number {
                     return Err(Error::InvalidJsonbNumber);
                 }
             },
+            NUMBER_NUMERIC => {
+                let text =
+                    std::str::from_utf8(&bytes[1..]).map_err(|_| Error::InvalidJsonbNumber)?;
+                Number::Numeric(Numeric::parse(text).map_err(|_| Error::InvalidJsonbNumber)?)
+            }
             _ => {
                 return Err(Error::InvalidJsonbNumber);
             }

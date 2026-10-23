@@ -655,7 +655,8 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
     ///
     /// Parsing strategy:
     /// 1. First try to parse as integer (i64/u64)
-    /// 2. If it contains decimal point or exponent, parse as floating point (f64)
+    /// 2. If it contains decimal point or exponent, or overflows 64 bits, read
+    ///    its exact value into the smallest decimal kind that holds it
     fn parse_standard_json_number(&mut self) -> Result<JsonAst<'a>> {
         let start_idx = self.idx;
 
@@ -735,8 +736,10 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
             }
         }
 
-        match fast_float2::parse(s) {
-            Ok(v) => Ok(JsonAst::Number(Number::Float64(v))),
+        // A fraction, an exponent or an integer past 64 bits keeps its exact
+        // value.
+        match Number::from_decimal_text(s) {
+            Ok(number) => Ok(JsonAst::Number(number)),
             Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
         }
     }
@@ -906,6 +909,16 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
         }
 
         self.idx = idx;
+        #[cfg(feature = "arbitrary_precision")]
+        if has_exponent {
+            // The exponent moves the decimal point; the value stays exact.
+            let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..idx]) };
+            return match Number::from_decimal_text(s) {
+                Ok(number) => Ok(Some(JsonAst::Number(number))),
+                Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+            };
+        }
+        #[cfg(not(feature = "arbitrary_precision"))]
         if has_exponent {
             let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..idx]) };
             return match fast_float2::parse(s) {
@@ -1252,12 +1265,22 @@ impl<'a, const STANDARD: bool> Parser<'a, STANDARD> {
             })));
         }
 
-        // Final fallback strategy: Parse as Float64 using fast_float2 library
-        // This handles scientific notation and very large/small numbers
+        // Scientific notation and values past 76 digits keep their exact
+        // value as a `numeric`.
         let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..self.idx]) };
-        match fast_float2::parse(s) {
-            Ok(v) => Ok(JsonAst::Number(Number::Float64(v))),
-            Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+        #[cfg(feature = "arbitrary_precision")]
+        {
+            match Number::from_decimal_text(s) {
+                Ok(number) => Ok(JsonAst::Number(number)),
+                Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+            }
+        }
+        #[cfg(not(feature = "arbitrary_precision"))]
+        {
+            match fast_float2::parse(s) {
+                Ok(v) => Ok(JsonAst::Number(Number::Float64(v))),
+                Err(_) => Err(self.error(ParseErrorCode::InvalidNumberValue)),
+            }
         }
     }
 
@@ -1955,6 +1978,31 @@ mod tests {
         })
     }
 
+    /// `value` with each number spelled as the parser keeps it: an exact
+    /// number in its `numeric` output text, which writes no exponent.
+    #[cfg(feature = "arbitrary_precision")]
+    fn canonical_numbers(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Number(number) => {
+                let text = crate::Numeric::parse(&number.to_string()).unwrap();
+                serde_json::Value::Number(serde_json::from_str(text.as_str()).unwrap())
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(canonical_numbers).collect())
+            }
+            serde_json::Value::Object(fields) => serde_json::Value::Object(
+                fields.into_iter().map(|(key, item)| (key, canonical_numbers(item))).collect(),
+            ),
+            other => other,
+        }
+    }
+
+    /// Without arbitrary precision every number is a float, kept as written.
+    #[cfg(not(feature = "arbitrary_precision"))]
+    fn canonical_numbers(value: serde_json::Value) -> serde_json::Value {
+        value
+    }
+
     proptest! {
         /// Tests the parser's ability to handle JSON5 syntax
         ///
@@ -1970,7 +2018,7 @@ mod tests {
             assert_eq!(res1.is_ok(), res2.is_ok());
             assert_eq!(res1.is_ok(), res3.is_ok());
             if res1.is_ok() {
-                let res1 = format!("{}", res1.unwrap());
+                let res1 = format!("{}", canonical_numbers(res1.unwrap()));
                 let res2 = format!("{}", res2.unwrap());
                 let res3 = format!("{}", res3.unwrap());
                 assert_eq!(res1, res2);
@@ -1993,7 +2041,7 @@ mod tests {
             assert_eq!(res1.is_ok(), res2.is_ok());
             assert_eq!(res1.is_ok(), res3.is_ok());
             if res1.is_ok() {
-                let res1 = format!("{}", res1.unwrap());
+                let res1 = format!("{}", canonical_numbers(res1.unwrap()));
                 let res2 = format!("{}", res2.unwrap());
                 let res3 = format!("{}", res3.unwrap());
                 assert_eq!(res1, res2);
@@ -2015,10 +2063,11 @@ mod tests {
             assert_eq!(res1.is_ok(), res2.is_ok());
             assert_eq!(res1.is_ok(), res3.is_ok());
             if res1.is_ok() {
+                let expected = format!("{}", canonical_numbers(res1.unwrap()));
                 let res2 = format!("{}", res2.unwrap());
                 let res3 = format!("{}", res3.unwrap());
-                assert_eq!(source, res2);
-                assert_eq!(source, res3);
+                assert_eq!(expected, res2);
+                assert_eq!(expected, res3);
             }
         }
     }

@@ -67,3 +67,4 @@ pub(crate) const NUMBER_STRUCT_FIELD_SCALE: &str = "$jsonb::private::Number::Sca
 pub(crate) const NUMBER_STRUCT_FIELD_VALUE: &str = "$jsonb::private::Number::Value";
 pub(crate) const NUMBER_STRUCT_FIELD_HIGH_VALUE: &str = "$jsonb::private::Number::High_Value";
 pub(crate) const NUMBER_STRUCT_FIELD_LOW_VALUE: &str = "$jsonb::private::Number::Low_Value";
+pub(crate) const NUMBER_STRUCT_FIELD_TEXT: &str = "$jsonb::private::Number::Text";

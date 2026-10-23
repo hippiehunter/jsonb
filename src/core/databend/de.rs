@@ -216,7 +216,8 @@ impl<'de> Deserializer<'de> {
             Number::Float64(_)
             | Number::Decimal64(_)
             | Number::Decimal128(_)
-            | Number::Decimal256(_) => Err(Error::UnexpectedType),
+            | Number::Decimal256(_)
+            | Number::Numeric(_) => Err(Error::UnexpectedType),
         }
     }
 
@@ -240,6 +241,9 @@ impl<'de> Deserializer<'de> {
             Number::Decimal256(v) => {
                 let n = v.to_float64();
                 T::from_f64(n).ok_or(Error::UnexpectedType)
+            }
+            ref numeric @ Number::Numeric(_) => {
+                T::from_f64(numeric.as_f64()).ok_or(Error::UnexpectedType)
             }
         }
     }
@@ -322,18 +326,18 @@ impl<'de> Deserializer<'de> {
                         }
                     }
                     Number::Float64(i) => visitor.visit_f64(i),
-                    Number::Decimal64(i) => {
-                        let v = i.to_float64();
-                        visitor.visit_f64(v)
-                    }
-                    Number::Decimal128(i) => {
-                        let v = i.to_float64();
-                        visitor.visit_f64(v)
-                    }
-                    Number::Decimal256(i) => {
-                        let v = i.to_float64();
-                        visitor.visit_f64(v)
-                    }
+                    // An exact number reaches an arbitrary-precision visitor
+                    // as its text, which serde_json keeps as written.
+                    #[cfg(feature = "arbitrary_precision")]
+                    exact @ (Number::Decimal64(_)
+                    | Number::Decimal128(_)
+                    | Number::Decimal256(_)
+                    | Number::Numeric(_)) => visit_number_text(visitor, exact.to_string()),
+                    #[cfg(not(feature = "arbitrary_precision"))]
+                    exact @ (Number::Decimal64(_)
+                    | Number::Decimal128(_)
+                    | Number::Decimal256(_)
+                    | Number::Numeric(_)) => visitor.visit_f64(exact.as_f64()),
                 }
             }
             EXTENSION_TAG => {
@@ -1042,4 +1046,15 @@ impl<'a> Decoder<'a> {
         }
         Ok(jentries)
     }
+}
+
+/// The number `text` as serde_json's arbitrary-precision numbers carry it: a
+/// map whose one key is serde_json's number token.
+#[cfg(feature = "arbitrary_precision")]
+fn visit_number_text<'de, V: Visitor<'de>>(visitor: V, text: String) -> Result<V::Value> {
+    const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+    visitor.visit_map(de::value::MapDeserializer::<_, Error>::new(std::iter::once((
+        NUMBER_TOKEN,
+        text,
+    ))))
 }

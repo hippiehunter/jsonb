@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use crate::constants::MAX_DECIMAL128_PRECISION;
+use crate::constants::MAX_DECIMAL256_PRECISION;
+use crate::constants::MAX_DECIMAL64_PRECISION;
 use crate::error::Result;
+use crate::numeric::compare_decimal_text;
+use crate::numeric::Numeric;
 use crate::Error;
 
 use ethnum::i256;
@@ -217,6 +223,10 @@ pub enum Number {
     Decimal128(Decimal128),
     /// 256-bit decimal with maximum precision, for extremely large exact decimals
     Decimal256(Decimal256),
+    /// An exact decimal past the fixed-width kinds: more than 76 digits, or a
+    /// display scale past 76 (`1e-400`, `1e400`, a float8's full expansion).
+    /// Any value PostgreSQL's `numeric` holds fits.
+    Numeric(Numeric),
 }
 
 impl<'de> Deserialize<'de> for Number {
@@ -282,6 +292,25 @@ impl Serialize for Number {
             Number::Int64(v) => serializer.serialize_i64(*v),
             Number::UInt64(v) => serializer.serialize_u64(*v),
             Number::Float64(v) => serializer.serialize_f64(*v),
+            #[cfg(feature = "arbitrary_precision")]
+            Number::Numeric(v) => {
+                use serde::ser::SerializeStruct;
+                if serializer.is_human_readable() {
+                    const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+                    let mut serialize_struct = serializer.serialize_struct(NUMBER_TOKEN, 1)?;
+                    serialize_struct.serialize_field(NUMBER_TOKEN, v.as_str())?;
+                    serialize_struct.end()
+                } else {
+                    use crate::constants::NUMBER_STRUCT_FIELD_TEXT;
+                    use crate::constants::NUMBER_STRUCT_TOKEN;
+                    let mut serialize_struct =
+                        serializer.serialize_struct(NUMBER_STRUCT_TOKEN, 1)?;
+                    serialize_struct.serialize_field(NUMBER_STRUCT_FIELD_TEXT, v.as_str())?;
+                    serialize_struct.end()
+                }
+            }
+            #[cfg(not(feature = "arbitrary_precision"))]
+            Number::Numeric(_) => serializer.serialize_f64(self.as_f64()),
             #[cfg(feature = "arbitrary_precision")]
             Number::Decimal64(_) | Number::Decimal128(_) | Number::Decimal256(_) => {
                 use serde::ser::SerializeStruct;
@@ -430,6 +459,7 @@ impl Number {
                     None
                 }
             }
+            Number::Numeric(v) => v.as_str().parse().ok(),
         }
     }
 
@@ -474,6 +504,7 @@ impl Number {
                     None
                 }
             }
+            Number::Numeric(v) => v.as_str().parse().ok(),
         }
     }
 
@@ -512,6 +543,7 @@ impl Number {
                     None
                 }
             }
+            Number::Numeric(v) => v.as_str().parse().ok(),
         }
     }
 
@@ -523,9 +555,15 @@ impl Number {
             Number::Int64(v) => *v as f64,
             Number::UInt64(v) => *v as f64,
             Number::Float64(v) => *v,
-            Number::Decimal64(v) => v.to_float64(),
-            Number::Decimal128(v) => v.to_float64(),
-            Number::Decimal256(v) => v.to_float64(),
+            // A decimal reads through its exact text, which rounds once to
+            // the nearest float; scaling the integer by a power of ten would
+            // round twice.
+            Number::Decimal64(_) | Number::Decimal128(_) | Number::Decimal256(_) => {
+                self.to_string().parse().unwrap_or(f64::NAN)
+            }
+            // The output text is a valid float literal; past f64's range it
+            // reads as an infinity or zero.
+            Number::Numeric(v) => v.as_str().parse().unwrap_or(f64::NAN),
         }
     }
 
@@ -572,6 +610,7 @@ impl Number {
                 };
                 Ok(Number::Decimal256(neg_dec))
             }
+            Number::Numeric(v) => Ok(Number::Numeric(v.negated())),
         }
     }
 
@@ -579,6 +618,7 @@ impl Number {
     ///
     /// This method returns an error if the sum would overflow.
     pub fn add(&self, other: Number) -> Result<Number> {
+        refuse_inexact_arithmetic(self, &other)?;
         match (self, other) {
             (Number::Int64(a), Number::Int64(b)) => a
                 .checked_add(b)
@@ -625,6 +665,7 @@ impl Number {
     ///
     /// This method returns an error if the difference would overflow.
     pub fn sub(&self, other: Number) -> Result<Number> {
+        refuse_inexact_arithmetic(self, &other)?;
         match (self, other) {
             (Number::Int64(a), Number::Int64(b)) => a
                 .checked_sub(b)
@@ -655,6 +696,7 @@ impl Number {
     ///
     /// This method returns an error if the product would overflow.
     pub fn mul(&self, other: Number) -> Result<Number> {
+        refuse_inexact_arithmetic(self, &other)?;
         match (self, other) {
             (Number::Int64(a), Number::Int64(b)) => a
                 .checked_mul(b)
@@ -701,6 +743,7 @@ impl Number {
     ///
     /// This method returns an error if the divisor is zero.
     pub fn div(&self, other: Number) -> Result<Number> {
+        refuse_inexact_arithmetic(self, &other)?;
         let a_float = self.as_f64();
         let b_float = other.as_f64();
         if b_float == 0.0 {
@@ -713,6 +756,7 @@ impl Number {
     ///
     /// This method returns an error if the divisor is zero.
     pub fn rem(&self, other: Number) -> Result<Number> {
+        refuse_inexact_arithmetic(self, &other)?;
         match (self, other) {
             (Number::Int64(a), Number::Int64(b)) => {
                 if b == 0 {
@@ -861,6 +905,9 @@ impl Ord for Number {
     /// - Only falls back to floating-point comparison as a last resort
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
+        if matches!(self, Number::Numeric(_)) || matches!(other, Number::Numeric(_)) {
+            return cmp_exact(self, other);
+        }
         match (self, other) {
             // Same type comparisons - use native comparison
             (Number::Int64(l), Number::Int64(r)) => l.cmp(r),
@@ -877,9 +924,7 @@ impl Ord for Number {
                     {
                         l_val.cmp(&r_val)
                     } else {
-                        let l = OrderedFloat(self.as_f64());
-                        let r = OrderedFloat(other.as_f64());
-                        l.cmp(&r)
+                        cmp_exact(self, other)
                     }
                 }
             }
@@ -894,9 +939,7 @@ impl Ord for Number {
                     {
                         l_val.cmp(&r_val)
                     } else {
-                        let l = OrderedFloat(self.as_f64());
-                        let r = OrderedFloat(other.as_f64());
-                        l.cmp(&r)
+                        cmp_exact(self, other)
                     }
                 }
             }
@@ -920,10 +963,8 @@ impl Ord for Number {
                             return l_val.cmp(&r.value);
                         }
                     }
-                    // multiply overflow, fallback to used float compare
-                    let l = OrderedFloat(self.as_f64());
-                    let r = OrderedFloat(other.as_f64());
-                    l.cmp(&r)
+                    // A scaled value past i256 compares through its text.
+                    cmp_exact(self, other)
                 }
             }
 
@@ -1115,7 +1156,7 @@ impl Ord for Number {
                 self.cmp(&Number::Decimal256(r_decimal))
             }
 
-            // Fall back to float comparison for any other combinations
+            // A float beside an exact kind compares as a float.
             (_, _) => {
                 let l = OrderedFloat(self.as_f64());
                 let r = OrderedFloat(other.as_f64());
@@ -1123,6 +1164,97 @@ impl Ord for Number {
             }
         }
     }
+}
+
+impl Number {
+    /// The value of a decimal spelling, exactly, in the smallest kind that
+    /// holds it: the kind the parser gives the spelling's `numeric` output
+    /// text. NaN and the infinities are refused.
+    pub fn from_decimal_text(text: &str) -> Result<Number> {
+        Numeric::parse(text).map(Number::from_numeric)
+    }
+
+    /// `numeric` in the smallest kind that holds it exactly, the kind the
+    /// parser gives its output text: an integer kind for a scale-0 value in
+    /// 64 bits, a decimal kind for up to 76 digits, [`Number::Numeric`] past
+    /// that.
+    pub fn from_numeric(numeric: Numeric) -> Number {
+        let (negative, integer, fraction) = numeric.parts();
+        // The parser does not count a lone integer zero as a digit.
+        let integer = if integer == "0" { "" } else { integer };
+        let precision = integer.len() + fraction.len();
+        let scale = fraction.len();
+        if precision > MAX_DECIMAL256_PRECISION {
+            return Number::Numeric(numeric);
+        }
+        let mut digits = String::with_capacity(precision.max(1));
+        digits.push_str(integer);
+        digits.push_str(fraction);
+        if digits.is_empty() {
+            digits.push('0');
+        }
+        if precision > MAX_DECIMAL128_PRECISION {
+            let Ok(magnitude) = digits.parse::<i256>() else {
+                return Number::Numeric(numeric);
+            };
+            return Number::Decimal256(Decimal256 {
+                scale: scale as u8,
+                value: if negative { -magnitude } else { magnitude },
+            });
+        }
+        let Ok(magnitude) = digits.parse::<i128>() else {
+            return Number::Numeric(numeric);
+        };
+        let value = if negative { -magnitude } else { magnitude };
+        if scale == 0 {
+            if let Ok(value) = u64::try_from(value) {
+                return Number::UInt64(value);
+            }
+            if let Ok(value) = i64::try_from(value) {
+                return Number::Int64(value);
+            }
+        }
+        if precision <= MAX_DECIMAL64_PRECISION {
+            return Number::Decimal64(Decimal64 {
+                scale: scale as u8,
+                value: value as i64,
+            });
+        }
+        Number::Decimal128(Decimal128 {
+            scale: scale as u8,
+            value,
+        })
+    }
+
+    /// The exact plain decimal spelling of an exact kind's value; `None` for
+    /// a float, which compares as a float.
+    fn exact_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Number::Numeric(v) => Some(Cow::Borrowed(v.as_str())),
+            Number::Float64(_) => None,
+            other => Some(Cow::Owned(other.to_string())),
+        }
+    }
+}
+
+/// Exact order between exact kinds, through their decimal spellings; a
+/// float on either side compares as a float, as it does beside every kind.
+fn cmp_exact(left: &Number, right: &Number) -> Ordering {
+    match (left.exact_text(), right.exact_text()) {
+        (Some(left), Some(right)) => compare_decimal_text(&left, &right),
+        _ => OrderedFloat(left.as_f64()).cmp(&OrderedFloat(right.as_f64())),
+    }
+}
+
+/// Arithmetic here runs in binary floating point, which cannot hold a
+/// [`Number::Numeric`]'s value; exact arithmetic is the caller's.
+fn refuse_inexact_arithmetic(left: &Number, right: &Number) -> Result<()> {
+    if matches!(left, Number::Numeric(_)) || matches!(right, Number::Numeric(_)) {
+        return Err(Error::Message(
+            "arithmetic on a numeric past 76 digits is not exact in jsonb".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Helper function to adjust decimal scales for comparison
@@ -1181,6 +1313,7 @@ impl Display for Number {
             Number::Decimal64(v) => format_decimal_i128(f, v.value as i128, v.scale as usize),
             Number::Decimal128(v) => format_decimal_i128(f, v.value, v.scale as usize),
             Number::Decimal256(v) => format_decimal_i256(f, v.value, v.scale as usize),
+            Number::Numeric(v) => f.write_str(v.as_str()),
         }
     }
 }

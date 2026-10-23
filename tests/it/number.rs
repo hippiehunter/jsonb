@@ -35,6 +35,7 @@
 // limitations under the License.
 
 use jsonb::RawJsonb;
+use jsonb::Numeric;
 use jsonb::{parse_value, parse_value_standard_mode};
 use ordered_float::OrderedFloat;
 
@@ -2281,26 +2282,18 @@ fn test_parse_float() {
         ("1.7976931348623157e+308", "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368"),
     ];
 
-    for (expected, test) in tests {
-        let v = parse_value(test.as_bytes()).unwrap();
-        let s = format!("{v}");
-        let buf = v.to_vec();
-        let r = RawJsonb::new(&buf);
-        let ss = r.to_string();
-
-        assert_eq!(expected, s);
-        assert_eq!(expected, ss);
-    }
-
-    // standard json
-    for (expected, test) in tests {
-        let v = parse_value_standard_mode(test.as_bytes()).unwrap();
-        let s = format!("{v}");
-        let buf = v.to_vec();
-        let r = RawJsonb::new(&buf);
-        let ss = r.to_string();
-
-        assert_eq!(expected, s);
-        assert_eq!(expected, ss);
+    // A literal is kept exactly, in its numeric spelling, and reads as the
+    // nearest float.
+    for (float, test) in tests {
+        let exact = Numeric::parse(test).unwrap();
+        let float: f64 = float.parse().unwrap();
+        for v in [parse_value(test.as_bytes()).unwrap(), parse_value_standard_mode(test.as_bytes()).unwrap()] {
+            let buf = v.to_vec();
+            let r = RawJsonb::new(&buf);
+            assert_eq!(exact.as_str(), format!("{v}"));
+            assert_eq!(exact.as_str(), r.to_string());
+            assert_eq!(OrderedFloat(float), OrderedFloat(v.as_f64().unwrap()));
+            assert_eq!(OrderedFloat(float), OrderedFloat(r.as_f64().unwrap().unwrap()));
+        }
     }
 }
